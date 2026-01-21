@@ -1,40 +1,19 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# install.sh
 
-# Load core functionality
-#!/bin/bash
+source "$(dirname "$(realpath "$0" 2>/dev/null || readlink -f "$0")")/core.sh" 2>/dev/null ||
+    { echo "Cannot load core.sh"; exit 1; }
 
-# 1. Try to find core.sh relative to the command as executed
-CORE_FILE="$(dirname "$0")/core.sh"
+echo "Starting installation..."
 
-if [ ! -f "$CORE_FILE" ]; then
-    # 2. Fallback: Resolve symlink to find the actual physical directory
-    REAL_SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || perl -MCwd -e 'print Cwd::abs_path shift' "$0")
-    SOURCE_DIR="$(dirname "$REAL_SCRIPT_PATH")"
-    CORE_FILE="$SOURCE_DIR/core.sh"
-fi
-
-# 3. Final check and source
-if [ -f "$CORE_FILE" ]; then
-    source "$CORE_FILE"
+# SSH ключ
+read -r -p "Path to SSH private key [default: ~/.ssh/id_rsa]: " key
+key=${key:-"$HOME/.ssh/id_rsa"}
+if [[ -f "$key" ]]; then
+    sed -i "s|^SSH_GIT_KEY=.*|SSH_GIT_KEY=\"$key\"|" "$SETTINGS_FILE" 2>/dev/null
+    echo "SSH key set: $key"
 else
-    echo "Fatal Error: core.sh not found!"
-    echo "Checked: $(dirname "$0")/core.sh"
-    echo "Checked: $CORE_FILE"
-    exit 1
-fi
-
-log_private "Installation started."
-
-# 1. SSH Key setup
-read -p "Enter the full path to your SSH private key (default: $HOME/.ssh/id_rsa): " ssh_key_path
-ssh_key_path=${ssh_key_path:-"$HOME/.ssh/id_rsa"}
-
-if [ -f "$ssh_key_path" ]; then
-    # Update config with the provided key path
-    sed -i "s|SSH_GIT_KEY=.*|SSH_GIT_KEY=\"$ssh_key_path\"|" "$SETTINGS_FILE"
-    log_private "SSH key set to: $ssh_key_path"
-else
-    log_public "Warning: SSH key not found at $ssh_key_path. Ensure it exists before the first run."
+    echo "Warning: SSH key not found at $key"
 fi
 
 # 2. Symlinks setup & Privilege Elevation logic
@@ -93,33 +72,92 @@ if [ "$LINKS_INSTALLED" = false ]; then
     exit 1
 fi
 
-# 3. Schedule setup (Cron)
-read -p "Enter backup frequency in cron format (default: weekly '0 0 * * 1'): " cron_freq
-cron_freq=${cron_freq:-"0 0 * * 1"}
-(crontab -l 2>/dev/null | grep -v "git-committer") | { cat; echo "$cron_freq ${SYMLINKS[1]}"; } | crontab -
-log_public "Cron schedule updated: $cron_freq"
 
-# 4. Repository list setup
-echo "----------------------------------------------------------------"
-echo "Enter paths to repositories one by one."
-echo "Press Enter on an empty line to finish."
-echo "----------------------------------------------------------------"
+# systemd unit + timer
+UNIT="git-auto-commit"
+mkdir -p ~/.config/systemd/user
 
+cat > ~/.config/systemd/user/$UNIT.service <<'EOF'
+[Unit]
+Description=Automatic git commit & push for tracked repositories
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/git-committer
+Restart=on-failure
+RestartSec=45
+StandardOutput=journal
+StandardError=journal
+EOF
+
+# Запрос частоты
+echo
+echo "How often should auto-commit run?"
+echo "  Examples:"
+echo "    weekly         → every Monday at 00:15"
+echo "    daily          → every day at 01:00"
+echo "    0 3 * * *      → every day at 03:00"
+echo "    Mon,Thu *-*-* 02:30:00 → Mondays and Thursdays at 02:30"
+echo
+
+read -r -p "Enter schedule (OnCalendar format) or keyword [weekly]: " schedule
+
+case "${schedule:-weekly}" in
+    daily|"every day")          oncal="*-*-* 01:00:00" ;;
+    weekly|"every week")        oncal="Mon *-*-* 00:15:00" ;;
+    "")                         oncal="Mon *-*-* 00:15:00" ;;
+    *)
+        # Простая проверка — хотя бы похоже на cron/OnCalendar
+        if [[ "$schedule" =~ ^[A-Za-z0-9*,/-]+(\s+[0-9*:,-]+)+$ ]] ||
+           [[ "$schedule" =~ ^[A-Za-z]+(\s+[-*0-9]+)+(\s+[0-9*:,]+)+$ ]]; then
+            oncal="$schedule"
+        else
+            echo "Unrecognized format → using default (weekly)"
+            oncal="Mon *-*-* 00:15:00"
+        fi
+        ;;
+esac
+
+cat > ~/.config/systemd/user/$UNIT.timer <<EOF
+[Unit]
+Description=Timer for git auto-commit
+
+[Timer]
+OnCalendar=$oncal
+Persistent=true
+RandomizedDelaySec=600   # ±10 минут
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now $UNIT.timer 2>/dev/null || {
+    systemctl --user restart $UNIT.timer
+}
+
+echo
+echo "Timer installed with schedule: $oncal"
+echo
+echo "To change schedule later:"
+echo "  1. Edit file:   nano ~/.config/systemd/user/git-auto-commit.timer"
+echo "  2. Change OnCalendar=..."
+echo "  3. Then run:"
+echo "     systemctl --user daemon-reload"
+echo "     systemctl --user restart git-auto-commit.timer"
+echo
+echo "Useful commands:"
+echo "  journalctl --user -u git-auto-commit -f          # live logs"
+echo "  systemctl --user status git-auto-commit.timer    # when next run"
+echo "  systemctl --user list-timers --all               # all user timers"
+
+# Добавление репозиториев (как раньше)
+echo
+echo "Add repositories now?"
 while true; do
-    read -r -p "Path: " input_path
-    [ -z "$input_path" ] && break
-    
-    # Remove quotes
-    clean_path="${input_path%\"}"
-    clean_path="${clean_path#\"}"
-    
-    # Execute manager
-    if [ -f "$(dirname "$0")/manager.sh" ]; then
-        bash "$(dirname "$0")/manager.sh" "$clean_path"
-    else
-        log_public "Error: manager.sh not found."
-    fi
+    read -r -p "Path (empty to finish): " path
+    [[ -z "$path" ]] && break
+    git-manager "${path}"
 done
 
-log_public "Setup complete. Config: $SETTINGS_FILE"
-log_private "Installation finished successfully."
+echo "Installation complete."

@@ -1,87 +1,66 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# committer.sh
 
-# Load core functionality and shared variables
-#!/bin/bash
-
-# 1. Try to find core.sh relative to the command as executed
-CORE_FILE="$(dirname "$0")/core.sh"
-
-if [ ! -f "$CORE_FILE" ]; then
-    # 2. Fallback: Resolve symlink to find the actual physical directory
-    REAL_SCRIPT_PATH=$(readlink -f "$0" 2>/dev/null || perl -MCwd -e 'print Cwd::abs_path shift' "$0")
-    SOURCE_DIR="$(dirname "$REAL_SCRIPT_PATH")"
-    CORE_FILE="$SOURCE_DIR/core.sh"
-fi
-
-# 3. Final check and source
-if [ -f "$CORE_FILE" ]; then
-    source "$CORE_FILE"
+# Поиск core.sh
+if [[ -f "${0%/*}/core.sh" ]]; then
+    source "${0%/*}/core.sh"
+elif [[ -f "$(dirname "$(realpath "$0" 2>/dev/null || readlink -f "$0")")/core.sh" ]]; then
+    source "$(dirname "$(realpath "$0" 2>/dev/null || readlink -f "$0")")/core.sh"
 else
-    echo "Fatal Error: core.sh not found!"
-    echo "Checked: $(dirname "$0")/core.sh"
-    echo "Checked: $CORE_FILE"
+    echo "Fatal: core.sh not found" >&2
     exit 1
 fi
 
-# Ensure git commands can find the SSH key and binaries in cron environment
-source "$SETTINGS_FILE"
+export PATH="/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin"
 export GIT_SSH_COMMAND="ssh -i $SSH_GIT_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
-export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-log_private "Scheduled backup process started."
+echo "git-auto-commit started at $(date '+%Y-%m-%d %H:%M:%S')"
 
-if [ ! -s "$REPOS_FILE" ]; then
-    log_private "No repositories found in the tracking list. Exiting."
+[[ ! -s "$REPOS_FILE" ]] && {
+    echo "No repositories in $REPOS_FILE → exiting"
     exit 0
-fi
+}
 
-# Process each repository in the list
-while IFS= read -r repo_path || [ -n "$repo_path" ]; do
-    # Skip empty linesё
-    [[ -z "$repo_path" ]] && continue
+while IFS= read -r repo || [[ -n "$repo" ]]; do
+    [[ -z "$repo" ]] && continue
+    [[ ! -d "$repo" ]] && { echo "Directory gone: $repo"; continue; }
+    [[ ! -d "$repo/.git" ]] && { echo "Not a git repo anymore: $repo"; continue; }
 
-    if [ ! -d "$repo_path" ]; then
-        log_public "Warning: Repository directory $repo_path no longer exists. Skipping."
-        continue
+    cd "$repo" || continue
+
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    [[ -z "$branch" ]] && { echo "Cannot determine branch in $repo"; continue; }
+
+    changed=false
+    # 1. Есть ли изменения в рабочей копии / индексе?
+    if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+        git add --all .
+        msg="Auto-backup $(date '+%Y-%m-%d %H:%M')"
+        if git commit -q -m "$msg"; then
+            echo "COMMITTED in $repo @ $branch → $msg"
+            changed=true
+        else
+            echo "Commit failed in $repo"
+        fi
     fi
 
-    cd "$repo_path" || continue
+    # 2. Есть ли незапушенные коммиты? (в т.ч. только что сделанный)
+    if git rev-list --count "@{upstream}..HEAD" 2>/dev/null | grep -qE '^[1-9]'; then
+        start=$(date +%s)
+        push_out=$(git push --quiet origin "$branch" 2>&1)
+        ret=$?
+        duration=$(( $(date +%s) - start ))
 
-    # Check for changes (including untracked files)
-    if [ -n "$(git status --porcelain)" ]; then
-        current_branch=$(git rev-parse --abbrev-ref HEAD)
-        
-        # 1. Commit Stage: Gather statistics
-        # We use --shortstat to get "X files changed, Y insertions(+), Z deletions(-)"
-        git add .
-        commit_msg="Auto-backup: $(date '+%Y-%m-%d %H:%M')"
-        git commit -m "$commit_msg" > /dev/null
-        
-        # Get stats of the last commit
-        stats=$(git diff --shortstat HEAD~1 HEAD 2>/dev/null || echo "Initial commit or stats unavailable")
-        log_public "COMMITTED: Changes in [$repo_path] on branch [$current_branch]. Stats: $stats"
-
-        # 2. Push Stage: Measure time and payload size
-        # We capture the time taken and use 'git count-objects' for a rough estimate of size
-        start_time=$(date +%s)
-        
-        # Capture stderr to get push details (size/objects)
-        push_output=$(git push origin "$current_branch" 2>&1)
-        push_exit_code=$?
-        
-        end_time=$(date +%s)
-        duration=$((end_time - start_time))
-
-        if [ $push_exit_code -eq 0 ]; then
-            # Extracting object count/size info from git output if available
-            log_public "PUSHED: [$repo_path] successfully. Duration: ${duration}s. Remote: origin/$current_branch"
+        if [[ $ret -eq 0 ]]; then
+            echo "PUSHED $repo @ $branch (${duration}s)"
         else
-            log_public "ERROR: Failed to push [$repo_path]. Git output: $push_output"
+            echo "PUSH FAILED $repo @ $branch (code $ret)"
+            [[ -n "$push_out" ]] && echo "→ $push_out"
         fi
-    else
-        log_private "No changes detected in [$repo_path]. Skipping."
+    elif [[ "$changed" = false ]]; then
+        echo "Nothing to do in $repo @ $branch"
     fi
 
 done < "$REPOS_FILE"
 
-log_private "Scheduled backup process finished."
+echo "git-auto-commit finished at $(date '+%Y-%m-%d %H:%M:%S')"
