@@ -1,79 +1,99 @@
 #!/usr/bin/env bash
-# install.sh
+# install.sh — setup git-auto-commit (systemd timer + symlinks)
 
-source "$(dirname "$(realpath "$0" 2>/dev/null || readlink -f "$0")")/core.sh" 2>/dev/null ||
-    { echo "Cannot load core.sh"; exit 1; }
 
-echo "Starting installation..."
-
-# SSH ключ
-read -r -p "Path to SSH private key [default: ~/.ssh/id_rsa]: " key
-key=${key:-"$HOME/.ssh/id_rsa"}
-if [[ -f "$key" ]]; then
-    sed -i "s|^SSH_GIT_KEY=.*|SSH_GIT_KEY=\"$key\"|" "$SETTINGS_FILE" 2>/dev/null
-    echo "SSH key set: $key"
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+if [[ -f "$SCRIPT_DIR/core.sh" ]]; then
+    source "$SCRIPT_DIR/core.sh"
 else
-    echo "Warning: SSH key not found at $key"
-fi
-
-# 2. Symlinks setup & Privilege Elevation logic
-SYMLINKS=("/usr/local/bin/git-manager" "/usr/local/bin/git-committer")
-SOURCE_FILES=("manager.sh" "committer.sh")
-LINKS_INSTALLED=false
-
-# Check if links already exist and are working
-if [ -L "${SYMLINKS[0]}" ] && [ -L "${SYMLINKS[1]}" ]; then
-    log_private "Symlinks already exist. Checking integrity..."
-    LINKS_INSTALLED=true
-fi
-
-if [ "$LINKS_INSTALLED" = false ]; then
-    read -p "Symlinks not found. Install them to /usr/local/bin? (Requires sudo) [Y/n]: " add_path
-    add_path=${add_path:-Y}
-
-    if [[ "$add_path" =~ ^[Yy]$ ]]; then
-        # Check if user has sudo potential (member of sudo or wheel groups)
-        if ! groups $USER | grep -qE '\b(sudo|wheel)\b' && [ "$EUID" -ne 0 ]; then
-            log_public "Error: User $USER is not in sudo/wheel group. Cannot escalate privileges."
-            exit 1
-        fi
-
-        log_private "Requesting administrative privileges for symlink creation..."
-        
-        # We use 'sudo -v' to validate credentials and 'sudo -n' to check if we can run it
-        if sudo -v; then
-            CMD_PREFIX="sudo"
-            
-            SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-            for i in "${!SYMLINKS[@]}"; do
-                if [ -f "$SCRIPT_DIR/${SOURCE_FILES[$i]}" ]; then
-                    # Atomic creation of symlink with privilege escalation
-                    if $CMD_PREFIX ln -sf "$SCRIPT_DIR/${SOURCE_FILES[$i]}" "${SYMLINKS[$i]}"; then
-                        $CMD_PREFIX chmod +x "$SCRIPT_DIR/${SOURCE_FILES[$i]}"
-                        log_public "Successfully installed symlink: ${SYMLINKS[$i]}"
-                        LINKS_INSTALLED=true
-                    else
-                        log_public "Error: Failed to create symlink even with sudo."
-                    fi
-                else
-                    log_public "Error: Source file $SCRIPT_DIR/${SOURCE_FILES[$i]} missing."
-                fi
-            done
-        else
-            log_public "Error: Sudo authentication failed or timed out."
-            exit 1
-        fi
-    fi
-fi
-
-# Interrupt if links are still missing
-if [ "$LINKS_INSTALLED" = false ]; then
-    log_public "Installation aborted: Symlinks are required. Please allow creation with sudo."
+    echo "Fatal: core.sh not found in $SCRIPT_DIR" >&2
     exit 1
 fi
 
+echo "Starting git-auto-commit installation..."
 
-# systemd unit + timer
+# Create symlinks in /usr/local/bin
+declare -A scripts=(
+    ["git-committer"]="committer.sh"
+    ["git-manager"]="manager.sh"
+)
+
+need_sudo=false
+for cmd in "${!scripts[@]}"; do
+    if [[ ! -L "/usr/local/bin/$cmd" || ! -x "/usr/local/bin/$cmd" ]]; then
+        need_sudo=true
+        break
+    fi
+done
+
+if $need_sudo; then
+    echo
+    read -r -p "Create symlinks in /usr/local/bin? (requires sudo) [Y/n] " ans
+    if [[ "${ans:-Y}" =~ ^[Yy]$ ]]; then
+        if ! sudo -v 2>/dev/null; then
+            echo "Error: sudo not available" >&2
+            exit 1
+        fi
+
+        for cmd in "${!scripts[@]}"; do
+            src="$SCRIPT_DIR/${scripts[$cmd]}"
+            if [[ -f "$src" ]]; then
+                sudo ln -sf "$src" "/usr/local/bin/$cmd"
+                sudo chmod +x "$src" 2>/dev/null
+                echo "Installed: /usr/local/bin/$cmd → $src"
+            else
+                echo "Source file not found: $src"
+            fi
+        done
+    else
+        echo "Installation aborted (symlinks are required for convenient usage)"
+        exit 1
+    fi
+fi
+
+# SSH usage notice
+echo
+echo "──────────────────────────────────────────────────────────────"
+echo "Important: this script does NOT set any SSH key path."
+echo "It uses your standard user SSH configuration:"
+echo "  • ~/.ssh/config (recommended for custom keys/hosts)"
+echo "  • ssh-agent (if you added your key there)"
+echo "  • default key names (~/.ssh/id_ed25519, id_rsa, etc.)"
+echo
+echo "Example ~/.ssh/config content (for GitHub):"
+echo
+cat << 'EOF'
+# Example ~/.ssh/config
+Host github.com
+    User git
+    IdentityFile ~/.ssh/id_ed25519_github
+    IdentitiesOnly yes
+    AddKeysToAgent yes
+EOF
+
+echo
+read -r -p "Show your current ~/.ssh/config file? (y/N) " show_config
+if [[ "${show_config:-N}" =~ ^[Yy]$ ]]; then
+    echo
+    if [[ -f "$HOME/.ssh/config" ]]; then
+        echo "Your current ~/.ssh/config:"
+        echo "────────────────────────────────────────"
+        cat "$HOME/.ssh/config"
+        echo "────────────────────────────────────────"
+    else
+        echo "No ~/.ssh/config file found yet."
+        echo "You can create it with: nano ~/.ssh/config"
+    fi
+    echo
+fi
+
+echo "Make sure your key is loaded if needed:"
+echo "  ssh-add ~/.ssh/your_key   (only needed once per login)"
+echo "or set up ssh-agent as a systemd service for automatic loading."
+echo "──────────────────────────────────────────────────────────────"
+echo
+
+# systemd user timer setup
 UNIT="git-auto-commit"
 mkdir -p ~/.config/systemd/user
 
@@ -90,7 +110,6 @@ StandardOutput=journal
 StandardError=journal
 EOF
 
-# Запрос частоты
 echo
 echo "How often should auto-commit run?"
 echo "  Examples:"
@@ -120,44 +139,43 @@ esac
 
 cat > ~/.config/systemd/user/$UNIT.timer <<EOF
 [Unit]
-Description=Timer for git auto-commit
+Description=Timer for $UNIT
 
 [Timer]
 OnCalendar=$oncal
 Persistent=true
-RandomizedDelaySec=600   # ±10 минут
+RandomizedDelaySec=600
 
 [Install]
 WantedBy=timers.target
 EOF
 
 systemctl --user daemon-reload
-systemctl --user enable --now $UNIT.timer 2>/dev/null || {
-    systemctl --user restart $UNIT.timer
-}
+systemctl --user enable --now "$UNIT.timer" 2>/dev/null || systemctl --user restart "$UNIT.timer"
 
 echo
-echo "Timer installed with schedule: $oncal"
-echo
-echo "To change schedule later:"
-echo "  1. Edit file:   nano ~/.config/systemd/user/git-auto-commit.timer"
-echo "  2. Change OnCalendar=..."
-echo "  3. Then run:"
-echo "     systemctl --user daemon-reload"
+echo "Timer installed with schedule: $$oncal"
+echo "To change later:"
+echo "  1. Edit ~/.config/systemd/user/git-auto-commit.timer"
+echo "  2. Run: systemctl --user daemon-reload"
 echo "     systemctl --user restart git-auto-commit.timer"
 echo
-echo "Useful commands:"
-echo "  journalctl --user -u git-auto-commit -f          # live logs"
-echo "  systemctl --user status git-auto-commit.timer    # when next run"
-echo "  systemctl --user list-timers --all               # all user timers"
 
-# Добавление репозиториев (как раньше)
-echo
-echo "Add repositories now?"
+# Add repositories
+echo "Add repositories to track:"
+echo "--------------------------------"
 while true; do
-    read -r -p "Path (empty to finish): " path
+    read -r -p "Path to repo (empty to finish): " path
     [[ -z "$path" ]] && break
-    git-manager "${path}"
+    if command -v git-manager >/dev/null 2>&1; then
+        git-manager "$path"
+    else
+        echo "git-manager not in PATH yet → run installation again or add manually"
+    fi
 done
 
-echo "Installation complete."
+echo
+echo "Installation finished."
+echo "View logs:     journalctl --user -u git-auto-commit -f"
+echo "Timer status:  systemctl --user status git-auto-commit.timer"
+echo "Next runs:     systemctl --user list-timers --all"
