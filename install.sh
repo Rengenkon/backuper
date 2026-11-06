@@ -1,181 +1,77 @@
 #!/usr/bin/env bash
-# install.sh — setup git-auto-commit (systemd timer + symlinks)
+# Run as the target user, never through sudo.
+set -euo pipefail
 
-
-SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
-if [[ -f "$SCRIPT_DIR/core.sh" ]]; then
-    source "$SCRIPT_DIR/core.sh"
-else
-    echo "Fatal: core.sh not found in $SCRIPT_DIR" >&2
+if [[ "${EUID}" -eq 0 ]]; then
+    echo "Run this installer as a normal user, without sudo." >&2
     exit 1
 fi
-
-echo "Starting git-auto-commit installation..."
-
-# Create symlinks in /usr/local/bin
-declare -A scripts=(
-    ["git-committer"]="committer.sh"
-    ["git-manager"]="manager.sh"
-)
-
-need_sudo=false
-for cmd in "${!scripts[@]}"; do
-    if [[ ! -L "/usr/local/bin/$cmd" || ! -x "/usr/local/bin/$cmd" ]]; then
-        need_sudo=true
-        break
-    fi
-done
-
-if $need_sudo; then
-    echo
-    read -r -p "Create symlinks in /usr/local/bin? (requires sudo) [Y/n] " ans
-    if [[ "${ans:-Y}" =~ ^[Yy]$ ]]; then
-        if ! sudo -v 2>/dev/null; then
-            echo "Error: sudo not available" >&2
-            exit 1
-        fi
-
-        for cmd in "${!scripts[@]}"; do
-            src="$SCRIPT_DIR/${scripts[$cmd]}"
-            if [[ -f "$src" ]]; then
-                sudo ln -sf "$src" "/usr/local/bin/$cmd"
-                sudo chmod +x "$src" 2>/dev/null
-                echo "Installed: /usr/local/bin/$cmd → $src"
-            else
-                echo "Source file not found: $src"
-            fi
-        done
-    else
-        echo "Installation aborted (symlinks are required for convenient usage)"
+for dependency in python3 git curl systemctl systemd-analyze; do
+    if ! command -v "$dependency" >/dev/null 2>&1; then
+        echo "Required command not found: $dependency" >&2
         exit 1
     fi
-fi
-
-# SSH usage notice
-echo
-echo "──────────────────────────────────────────────────────────────"
-echo "Important: this script does NOT set any SSH key path."
-echo "It uses your standard user SSH configuration:"
-echo "  • ~/.ssh/config (recommended for custom keys/hosts)"
-echo "  • ssh-agent (if you added your key there)"
-echo "  • default key names (~/.ssh/id_ed25519, id_rsa, etc.)"
-echo
-echo "Example ~/.ssh/config content (for GitHub):"
-echo
-cat << 'EOF'
-# Example ~/.ssh/config
-Host github.com
-    User git
-    IdentityFile ~/.ssh/id_ed25519_github
-    IdentitiesOnly yes
-    AddKeysToAgent yes
-EOF
-
-echo
-read -r -p "Show your current ~/.ssh/config file? (y/N) " show_config
-if [[ "${show_config:-N}" =~ ^[Yy]$ ]]; then
-    echo
-    if [[ -f "$HOME/.ssh/config" ]]; then
-        echo "Your current ~/.ssh/config:"
-        echo "────────────────────────────────────────"
-        cat "$HOME/.ssh/config"
-        echo "────────────────────────────────────────"
-    else
-        echo "No ~/.ssh/config file found yet."
-        echo "You can create it with: nano ~/.ssh/config"
-    fi
-    echo
-fi
-
-echo "Make sure your key is loaded if needed:"
-echo "  ssh-add ~/.ssh/your_key   (only needed once per login)"
-echo "or set up ssh-agent as a systemd service for automatic loading."
-echo "──────────────────────────────────────────────────────────────"
-echo
-
-# systemd user timer setup
-UNIT="git-auto-commit"
-mkdir -p ~/.config/systemd/user
-
-cat > ~/.config/systemd/user/$UNIT.service <<'EOF'
-[Unit]
-Description=Automatic git commit & push for tracked repositories
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/git-committer
-Restart=on-failure
-RestartSec=45
-StandardOutput=journal
-StandardError=journal
-EOF
-
-echo
-echo "How often should auto-commit run?"
-echo "  Examples:"
-echo "    weekly         → every Monday at 00:15"
-echo "    daily          → every day at 01:00"
-echo "    0 3 * * *      → every day at 03:00"
-echo "    Mon,Thu *-*-* 02:30:00 → Mondays and Thursdays at 02:30"
-echo
-
-read -r -p "Enter schedule (OnCalendar format) or keyword [weekly]: " schedule
-
-case "${schedule:-weekly}" in
-    daily|"every day")          oncal="*-*-* 01:00:00" ;;
-    weekly|"every week")        oncal="Mon *-*-* 00:15:00" ;;
-    "")                         oncal="Mon *-*-* 00:15:00" ;;
-    *)
-        # Простая проверка — хотя бы похоже на cron/OnCalendar
-        if [[ "$schedule" =~ ^[A-Za-z0-9*,/-]+(\s+[0-9*:,-]+)+$ ]] ||
-           [[ "$schedule" =~ ^[A-Za-z]+(\s+[-*0-9]+)+(\s+[0-9*:,]+)+$ ]]; then
-            oncal="$schedule"
-        else
-            echo "Unrecognized format → using default (weekly)"
-            oncal="Mon *-*-* 00:15:00"
-        fi
-        ;;
-esac
-
-cat > ~/.config/systemd/user/$UNIT.timer <<EOF
-[Unit]
-Description=Timer for $UNIT
-
-[Timer]
-OnCalendar=$oncal
-Persistent=true
-RandomizedDelaySec=600
-
-[Install]
-WantedBy=timers.target
-EOF
-
-systemctl --user daemon-reload
-systemctl --user enable --now "$UNIT.timer" 2>/dev/null || systemctl --user restart "$UNIT.timer"
-
-echo
-echo "Timer installed with schedule: $$oncal"
-echo "To change later:"
-echo "  1. Edit ~/.config/systemd/user/git-auto-commit.timer"
-echo "  2. Run: systemctl --user daemon-reload"
-echo "     systemctl --user restart git-auto-commit.timer"
-echo
-
-# Add repositories
-echo "Add repositories to track:"
-echo "--------------------------------"
-while true; do
-    read -r -p "Path to repo (empty to finish): " path
-    [[ -z "$path" ]] && break
-    if command -v git-manager >/dev/null 2>&1; then
-        git-manager "$path"
-    else
-        echo "git-manager not in PATH yet → run installation again or add manually"
-    fi
 done
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else "Python 3.9+ is required")'
 
-echo
-echo "Installation finished."
-echo "View logs:     journalctl --user -u git-auto-commit -f"
-echo "Timer status:  systemctl --user status git-auto-commit.timer"
-echo "Next runs:     systemctl --user list-timers --all"
+ref="${GIT_AUTO_COMMIT_REF:-v2}"
+temporary=$(mktemp -d)
+trap 'rm -rf -- "$temporary"' EXIT
+archive="$temporary/source.tar.gz"
+echo "Downloading Rengenkon/backuper at $ref..."
+curl --fail --show-error --silent --location --proto '=https' --proto-redir '=https' \
+    --connect-timeout 15 --max-time 180 \
+    "https://codeload.github.com/Rengenkon/backuper/tar.gz/$ref" --output "$archive"
+
+python3 - "$archive" "$temporary/source" <<'PY'
+import pathlib
+import sys
+import tarfile
+
+archive, target = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+target.mkdir()
+count = 0
+total = 0
+with tarfile.open(archive, "r:gz") as bundle:
+    for member in bundle:
+        parts = pathlib.PurePosixPath(member.name).parts
+        if len(parts) < 4 or parts[1:3] != ("src", "git_auto_commit"):
+            continue
+        relative = pathlib.PurePosixPath(*parts[1:])
+        if relative.is_absolute() or ".." in relative.parts or not member.isfile():
+            raise SystemExit("Unsafe archive entry")
+        if relative.suffix != ".py":
+            continue
+        count += 1
+        total += member.size
+        if count > 100 or total > 5_000_000:
+            raise SystemExit("Unexpected archive size")
+        output = target.joinpath(*relative.parts)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        stream = bundle.extractfile(member)
+        if stream is None:
+            raise SystemExit("Unreadable archive entry")
+        output.write_bytes(stream.read())
+required = ("__init__", "__main__", "cli", "config", "repositories", "git", "runner", "systemd", "installation")
+for name in required:
+    file = target / "src/git_auto_commit" / (name + ".py")
+    if not file.is_file():
+        raise SystemExit("Incomplete download: " + str(file))
+    compile(file.read_bytes(), str(file), "exec")
+PY
+
+export PYTHONPATH="$temporary/source/src"
+python3 -m git_auto_commit check-environment
+python3 - "$temporary/source/src" <<'PY'
+import sys
+from git_auto_commit.installation import install
+install(sys.argv[1])
+PY
+"$HOME/.local/bin/git-auto-commit" install-timer
+
+echo "Installation complete. Repository list and existing settings preserved."
+echo "Logs: journalctl --user -u git-auto-commit.service"
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) echo 'Add ~/.local/bin to PATH, for example: export PATH="$HOME/.local/bin:$PATH"' ;;
+esac
