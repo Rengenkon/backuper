@@ -14,7 +14,7 @@ for dependency in python3 git curl systemctl systemd-analyze; do
 done
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else "Python 3.9+ is required")'
 
-ref="${GIT_AUTO_COMMIT_REF:-v2}"
+ref="${GIT_AUTO_COMMIT_REF:-main}"
 temporary=$(mktemp -d)
 trap 'rm -rf -- "$temporary"' EXIT
 archive="$temporary/source.tar.gz"

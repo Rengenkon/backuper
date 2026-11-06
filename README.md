@@ -9,11 +9,11 @@ Requirements: Linux, Python **3.9+**, Git, curl, and a working **user systemd ma
 Run as your normal user:
 
 ```bash
-curl -fsSL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/Rengenkon/backuper/v2/install.sh | bash
+curl -fsSL --proto '=https' --proto-redir '=https' https://raw.githubusercontent.com/Rengenkon/backuper/main/install.sh | bash
 ```
 
-This URL will work once the `v2` branch is published. The installer downloads that branch
-over HTTPS. Installing from a branch trusts its current contents; for a reproducible
+The installer downloads the `main` branch over HTTPS.
+Installing from a branch trusts its current contents; for a reproducible
 installation, use a trusted release tag in both the installer URL and
 `GIT_AUTO_COMMIT_REF`. You can inspect the installer before executing it.
 
